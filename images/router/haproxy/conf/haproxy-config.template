@@ -7,10 +7,10 @@
 {{- $workingDir := .WorkingDir }}
 {{- $defaultDestinationCA := .DefaultDestinationCA }}
 global
-  maxconn {{env "ROUTER_MAX_CONNECTIONS" "20000"}}
+  maxconn {{envRE "\d+" "ROUTER_MAX_CONNECTIONS" "20000"}}  -- Log if it is present but doesn't match?  And then use the default
 
   daemon
-{{- with (env "ROUTER_SYSLOG_ADDRESS" "") }}
+{{- with (envRE "ip-addr-regex" "ROUTER_SYSLOG_ADDRESS" "") }}
   log {{.}} {{env "ROUTER_LOG_FACILITY" "local1"}} {{env "ROUTER_LOG_LEVEL" "warning"}}
 {{- end}}
   ca-base /etc/ssl
@@ -40,7 +40,7 @@ global
   # ssl-default-bind-ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:DHE-DSS-AES128-GCM-SHA256:kEDH+AESGCM:ECDHE-RSA-AES128-SHA256:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES256-SHA384:ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA:ECDHE-ECDSA-AES256-SHA:DHE-RSA-AES128-SHA256:DHE-RSA-AES128-SHA:DHE-DSS-AES128-SHA256:DHE-RSA-AES256-SHA256:DHE-DSS-AES256-SHA:DHE-RSA-AES256-SHA:ECDHE-RSA-DES-CBC3-SHA:ECDHE-ECDSA-DES-CBC3-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA256:AES256-SHA256:AES128-SHA:AES256-SHA:AES:DES-CBC3-SHA:HIGH:!aNULL:!eNULL:!EXPORT:!DES:!RC4:!MD5:!PSK:!aECDH:!EDH-DSS-DES-CBC3-SHA:!EDH-RSA-DES-CBC3-SHA:!KRB5-DES-CBC3-SHA
 
 defaults
-  maxconn {{env "ROUTER_MAX_CONNECTIONS" "20000"}}
+  maxconn {{env "ROUTER_MAX_CONNECTIONS" "20000"}} -- Do we delete this?  Surely the global applies?
 
   # Add x-forwarded-for header.
 {{- if ne (env "ROUTER_SYSLOG_ADDRESS" "") "" }}
@@ -60,6 +60,12 @@ defaults
 {{- else }}
   timeout connect 5s
 {{- end }}
+
+-- ^ BECOMES v
+
+timeout connect {{ firstMatch "[1-9][0-9]*(us|ms|s|m|h|d)?" (env "ROUTER_DEFAULT_CONNECT_TIMEOUT" "") "5s" }}
+
+
 {{- if (matchPattern "[1-9][0-9]*(us|ms|s|m|h|d)?" (env "ROUTER_DEFAULT_CLIENT_TIMEOUT" "")) }}
   timeout client {{env "ROUTER_DEFAULT_CLIENT_TIMEOUT" "30s"}}
 {{- else }}
@@ -95,6 +101,13 @@ defaults
   {{- end }}
 {{- end }}
 
+{{- if (matchPattern "true|TRUE" (env "ROUTER_ENABLE_COMPRESSION" "false")) }}
+  compression algo gzip
+  compression type {{ envRE '([0-9A-Za-z_\-]+/[0-9A-Za-z_\-]\s+)*([0-9A-Za-z_\-]+/[0-9A-Za-z_\-]/[0-9A-Za-z_\-]+/[0-9A-Za-z_\-]+)' "ROUTER_COMPRESSION_MIME" "text/html text/plain text/css" }}
+{{- end }}
+
+
+
 {{ if (gt .StatsPort 0) }}
   listen stats :{{.StatsPort}}
 {{- else }}
@@ -118,7 +131,7 @@ defaults
 frontend public
   bind :{{env "ROUTER_SERVICE_HTTP_PORT" "80"}}{{ if matchPattern "true|TRUE" (env "ROUTER_USE_PROXY_PROTOCOL" "") }} accept-proxy{{ end }}
   mode http
-  tcp-request inspect-delay 5s
+  tcp-request inspect-delay 5s        -- can this be moved to the defaults or global section?
   tcp-request content accept if HTTP
 
   # check if we need to redirect/force using https.
@@ -135,7 +148,7 @@ frontend public
   #       use_backend directives below this will be processed.
   use_backend be_http:%[base,map_reg(/var/lib/haproxy/conf/os_http_be.map)]
 
-  default_backend openshift_default
+  default_backend openshift_default    -- can this be in defaults?  And then overriden only in the one exception?
 
 # public ssl accepts all connections and isn't checking certificates yet certificates to use will be
 # determined by the next backend in the chain which may be an app backend (passthrough termination) or a backend
@@ -264,6 +277,8 @@ backend be_edge_http:{{$cfgIdx}}
   mode http
   option redispatch
   option forwardfor
+
+
     {{- with $balanceAlgo := index $cfg.Annotations "haproxy.router.openshift.io/balance" }}
       {{- with $matchValue := (matchValues $balanceAlgo "roundrobin" "leastconn" "source" ) }}
   balance {{ $balanceAlgo }}
@@ -275,11 +290,23 @@ backend be_edge_http:{{$cfgIdx}}
   balance {{ if gt $cfg.ActiveServiceUnits 1 }}roundrobin{{ else }}leastconn{{ end }}
       {{- end }}
     {{- end }}
+
+-- ^ BECOMES v
+
+  {{- if gt $cfg.ActiveServiceUnits 1 }}
+    balance {{ firstMatch "roundrobin|leastconn|source" annotation("haproxy.router.openshift.io/balance") env(ROUTER_LOAD_BALANCE_ALGORITHM) "roundrobin"}}
+  {{- else}}
+    balance {{ firstMatch "roundrobin|leastconn|source" annotation("haproxy.router.openshift.io/balance") env(ROUTER_LOAD_BALANCE_ALGORITHM) "leastconn"}}
+  {{- end}}
+
+
     {{- with $value := index $cfg.Annotations "haproxy.router.openshift.io/timeout"}}
       {{- if (matchPattern "[1-9][0-9]*(us|ms|s|m|h|d)?" $value) }}
   timeout server  {{$value}}
       {{- end }}
     {{- end }}
+
+
 
 {{- if matchPattern "true|TRUE" (index $cfg.Annotations "haproxy.router.openshift.io/rate-limit-connections") }}
   stick-table type ip size 100k expire 30s store conn_cur,conn_rate(3s),http_req_rate(10s)
@@ -308,6 +335,7 @@ backend be_edge_http:{{$cfgIdx}}
   http-request set-header X-Forwarded-Port %[dst_port]
   http-request set-header X-Forwarded-Proto http if !{ ssl_fc }
   http-request set-header X-Forwarded-Proto https if { ssl_fc }
+
   {{- if not (matchPattern "true|TRUE" (index $cfg.Annotations "haproxy.router.openshift.io/disable_cookies")) }}
     {{- if and (eq $cfg.TLSTermination "edge") (ne $cfg.InsecureEdgeTerminationPolicy "Allow") }}
   cookie {{$cfg.RoutingKeyName}} insert indirect nocache httponly secure
@@ -315,6 +343,17 @@ backend be_edge_http:{{$cfgIdx}}
   cookie {{$cfg.RoutingKeyName}} insert indirect nocache httponly
     {{- end }}
   {{- end }}
+
+-- ^ becomes c
+
+  {{- if not (matchPattern "true|TRUE" (index $cfg.Annotations "haproxy.router.openshift.io/disable_cookies")) }}
+  cookie {{$cfg.RoutingKeyName}} insert indirect nocache httponly
+    {{- if and (eq $cfg.TLSTermination "edge") (ne $cfg.InsecureEdgeTerminationPolicy "Allow") }} secure {{- end }}
+  {{- end }}
+
+
+
+
   http-request set-header Forwarded for=%[src];host=%[req.hdr(host)];proto=%[req.hdr(X-Forwarded-Proto)]
     {{- range $serviceUnitName, $weight := $cfg.ServiceUnitNames }}
       {{- if ne $weight 0 }}
@@ -323,11 +362,12 @@ backend be_edge_http:{{$cfgIdx}}
             {{- if $endpoint.NoHealthCheck }}
   server {{$endpoint.ID}} {{$endpoint.IP}}:{{$endpoint.Port}} cookie {{$endpoint.IdHash}} weight {{$weight}}
             {{- else }}
+
               {{- with $healthIntv := index $cfg.Annotations "router.openshift.io/haproxy.health.check.interval" }}
                 {{- if (matchPattern "[1-9][0-9]*(us|ms|s|m|h|d)?" $healthIntv) }}
   server {{$endpoint.ID}} {{$endpoint.IP}}:{{$endpoint.Port}} check inter {{$healthIntv}} cookie {{$endpoint.IdHash}} weight {{$weight}}
                 {{- else }}
-  server {{$endpoint.ID}} {{$endpoint.IP}}:{{$endpoint.Port}} check inter 5000ms cookie {{$endpoint.IdHash}} weight {{$weight}}
+  server {{$endpoint.ID}} {{$endpoint.IP}}:{{$endpoint.Port}} check inter 5000ms         cookie {{$endpoint.IdHash}} weight {{$weight}}
                 {{- end }}
               {{- else }}
                 {{- if (matchPattern "[1-9][0-9]*(us|ms|s|m|h|d)?" (env "ROUTER_BACKEND_CHECK_INTERVAL" "")) }}
@@ -336,6 +376,8 @@ backend be_edge_http:{{$cfgIdx}}
   server {{$endpoint.ID}} {{$endpoint.IP}}:{{$endpoint.Port}} check inter 5000ms cookie {{$endpoint.IdHash}} weight {{$weight}}
                 {{- end }}
               {{- end }}
+
+
             {{- end }}
           {{- end }}
         {{- end }}
@@ -484,6 +526,7 @@ backend be_secure:{{$cfgIdx}}
               {{- else }} verify none
               {{- end }}
             {{- end }}
+
             {{- if not $endpoint.NoHealthCheck }}
               {{- with $healthIntv := index $cfg.Annotations "router.openshift.io/haproxy.health.check.interval" }}
                 {{- if (matchPattern "[1-9][0-9]*(us|ms|s|m|h|d)?" $healthIntv) }} check inter {{$healthIntv}}
@@ -494,6 +537,15 @@ backend be_secure:{{$cfgIdx}}
                 {{- else }} check inter 5000ms
                 {{- end }}
               {{- end }}{{/* end get health interval annotation */}}
+            {{- end }}{{/* end else no health check */}}
+
+-- ^ becomes v
+
+            {{- if not $endpoint.NoHealthCheck }} check inter {{ firstMatch "" annotation("router.openshift.io/haproxy.health.check.interval") env("ROUTER_BACKEND_CHECK_INTERVAL") "5000ms" }}
+            {{- end }}{{/* end else no health check */}}
+
+
+
             {{- end }}{{/* end else no health check */}}
           {{- end }}{{/* end range endpointsForAlias */}}
         {{- end }}{{/* end get serviceUnit from its name */}}
